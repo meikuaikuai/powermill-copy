@@ -12,6 +12,10 @@ import shutil
 import subprocess
 import threading
 import time
+import stat
+import logging
+import traceback
+import platform
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from pathlib import Path
@@ -139,6 +143,16 @@ TEXTS = {
     "s_footer": "MeiKuaiKuai 用心出品",
     "s_close": "  关闭  ",
     "s_no_pil": "请先安装 Pillow:\npip install Pillow",
+    "log_btn": "  错误日志  ",
+    "log_title": "错误日志",
+    "log_empty": "暂无错误记录，运行正常！",
+    "log_copy_ok": "日志内容已复制到剪贴板，可直接粘贴反馈给开发者。",
+    "log_copy_btn": "复制日志内容",
+    "log_open_btn": "打开日志文件",
+    "log_clear_btn": "清空日志",
+    "log_cleared": "日志已清空。",
+    "m_move_partial": "剪切完成，但以下文件删除失败（已复制到目标）：\n{}",
+    "m_move_skip": "跳过(权限不足): {}",
   },
   "en": {
     "support_btn": "  Support & Contact  ",
@@ -250,6 +264,16 @@ TEXTS = {
     "s_footer": "Made with dedication by MeiKuaiKuai",
     "s_close": "  Close  ",
     "s_no_pil": "Please install Pillow:\npip install Pillow",
+    "log_btn": "  Error Log  ",
+    "log_title": "Error Log",
+    "log_empty": "No errors recorded. Everything is working fine!",
+    "log_copy_ok": "Log copied to clipboard. You can paste it to report issues.",
+    "log_copy_btn": "Copy Log",
+    "log_open_btn": "Open Log File",
+    "log_clear_btn": "Clear Log",
+    "log_cleared": "Log cleared.",
+    "m_move_partial": "Move completed, but failed to delete these files (already copied):\n{}",
+    "m_move_skip": "Skipped (access denied): {}",
   }
 }
 
@@ -294,7 +318,57 @@ def save_config(config):
 
 
 # ============================================================
-# C. 通用工具函数
+# C. 日志系统
+# ============================================================
+
+LOG_FILE = os.path.join(get_app_dir(), "error_log.txt")
+
+def setup_logging():
+    logger = logging.getLogger("PA")
+    logger.setLevel(logging.DEBUG)
+    # 文件输出
+    fh = logging.FileHandler(LOG_FILE, encoding="utf-8")
+    fh.setLevel(logging.DEBUG)
+    fh.setFormatter(logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
+    logger.addHandler(fh)
+    return logger
+
+logger = setup_logging()
+
+def get_system_info():
+    """收集系统信息，用于错误报告"""
+    info = []
+    info.append(f"OS: {platform.system()} {platform.version()}")
+    info.append(f"Python: {platform.python_version()}")
+    info.append(f"App Dir: {get_app_dir()}")
+    try:
+        import ctypes
+        info.append(f"Admin: {ctypes.windll.shell32.IsUserAnAdmin() != 0}")
+    except Exception:
+        info.append("Admin: N/A")
+    return " | ".join(info)
+
+def log_error(context, error, extra=""):
+    """记录错误到日志文件"""
+    msg = f"[{context}] {type(error).__name__}: {error}"
+    if extra:
+        msg += f" | {extra}"
+    msg += f"\n  System: {get_system_info()}"
+    msg += f"\n  Traceback:\n{''.join(traceback.format_exception(type(error), error, error.__traceback__))}"
+    logger.error(msg)
+
+def _rmtree_onerror(func, path, exc_info):
+    """shutil.rmtree 错误回调：尝试去掉只读属性后重试"""
+    try:
+        os.chmod(path, stat.S_IWRITE | stat.S_IREAD)
+        func(path)
+    except Exception as e:
+        log_error("rmtree_retry", e, f"path={path}")
+
+
+# ============================================================
+# D. 通用工具函数
 # ============================================================
 
 INVALID_CHARS = re.compile(r'[\\/:*?"<>|]')
@@ -433,14 +507,19 @@ def run_copy_engine(tasks, progress_cb, done_cb, error_cb, cancel_event,
         copied_bytes = 0
         last_up = 0
         lock = threading.Lock()
+        copy_errors = []
         base = os.path.dirname(tasks[0][0]) if tasks else ""
 
         def _do(task):
             if cancel_event.is_set():
-                return None, 0
+                return None, 0, None
             s, d, sz = task
-            shutil.copy2(s, d)
-            return s, sz
+            try:
+                shutil.copy2(s, d)
+                return s, sz, None
+            except Exception as e:
+                log_error("copy_file", e, f"src={s} dst={d}")
+                return s, sz, str(e)
 
         with ThreadPoolExecutor(max_workers=workers) as pool:
             futs = {pool.submit(_do, t): t for t in tasks}
@@ -448,9 +527,11 @@ def run_copy_engine(tasks, progress_cb, done_cb, error_cb, cancel_event,
                 if cancel_event.is_set():
                     pool.shutdown(wait=False, cancel_futures=True)
                     return
-                s, sz = f.result()
+                s, sz, err = f.result()
                 if s is None:
                     continue
+                if err:
+                    copy_errors.append(f"{os.path.basename(s)}: {err}")
                 with lock:
                     copied_files += 1
                     copied_bytes += sz
@@ -476,16 +557,32 @@ def run_copy_engine(tasks, progress_cb, done_cb, error_cb, cancel_event,
                         })
                         last_up = now
 
+        # 删除源文件（剪切模式）
+        delete_errors = []
         if delete_sources and not cancel_event.is_set():
             progress_cb({"phase": "scan", "message": "deleting..."})
             for sp in delete_sources:
-                if os.path.isdir(sp):
-                    shutil.rmtree(sp)
-                elif os.path.isfile(sp):
-                    os.remove(sp)
+                try:
+                    if os.path.isdir(sp):
+                        shutil.rmtree(sp, onerror=_rmtree_onerror)
+                    elif os.path.isfile(sp):
+                        try:
+                            os.remove(sp)
+                        except PermissionError:
+                            os.chmod(sp, stat.S_IWRITE | stat.S_IREAD)
+                            os.remove(sp)
+                except Exception as e:
+                    log_error("delete_source", e, f"path={sp}")
+                    delete_errors.append(os.path.basename(sp))
 
-        done_cb(copied_files, total_bytes, time.time() - t0)
+        all_errors = copy_errors + [f"[Delete] {x}" for x in delete_errors]
+        if all_errors:
+            logger.warning(f"Operation completed with {len(all_errors)} errors")
+
+        done_cb(copied_files, total_bytes, time.time() - t0,
+                delete_errors=delete_errors, copy_errors=copy_errors)
     except Exception as e:
+        log_error("copy_engine", e)
         error_cb(e)
 
 
@@ -594,6 +691,117 @@ class PersonalAssistant(tk.Tk):
             command=self._show_support_dialog)
         self._reg(self._support_btn, "support_btn")
         self._support_btn.pack(side="right", padx=8, pady=10)
+
+        # 日志按钮
+        self._log_btn = tk.Button(
+            top, font=("Segoe UI", 10), fg="white", bg="#f39c12",
+            activebackground="#e67e22", activeforeground="white",
+            relief="flat", cursor="hand2", bd=0,
+            command=self._show_log_dialog)
+        self._reg(self._log_btn, "log_btn")
+        self._log_btn.pack(side="right", pady=10)
+
+    # ---- 日志弹窗 ----
+
+    def _show_log_dialog(self):
+        d = tk.Toplevel(self)
+        d.title(self.t("log_title"))
+        d.geometry("650x500")
+        d.resizable(True, True)
+        d.configure(bg="white")
+        d.transient(self)
+        d.grab_set()
+
+        tk.Frame(d, bg="#f39c12", height=6).pack(fill="x")
+
+        tk.Label(d, text=self.t("log_title"),
+                 font=("Segoe UI", 16, "bold"), fg="#2c3e50", bg="white"
+                 ).pack(pady=(15, 5))
+
+        # 系统信息
+        sys_info = get_system_info()
+        tk.Label(d, text=sys_info, font=("Consolas", 8),
+                 fg="#999", bg="white").pack(pady=(0, 10))
+
+        # 日志内容
+        tf = tk.Frame(d, bg="white")
+        tf.pack(fill="both", expand=True, padx=15, pady=(0, 10))
+        log_text = tk.Text(tf, wrap="word", font=("Consolas", 9),
+                           bg="#f8f8f8", fg="#333", relief="solid", bd=1)
+        sb = ttk.Scrollbar(tf, command=log_text.yview)
+        log_text.config(yscrollcommand=sb.set)
+        log_text.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+
+        # 读取日志
+        try:
+            if os.path.isfile(LOG_FILE):
+                with open(LOG_FILE, "r", encoding="utf-8") as f:
+                    content = f.read()
+                if content.strip():
+                    log_text.insert("1.0", content)
+                else:
+                    log_text.insert("1.0", self.t("log_empty"))
+            else:
+                log_text.insert("1.0", self.t("log_empty"))
+        except Exception as e:
+            log_text.insert("1.0", f"Error reading log: {e}")
+        log_text.config(state="disabled")
+
+        # 按钮栏
+        btn_frame = tk.Frame(d, bg="white")
+        btn_frame.pack(pady=(0, 15))
+
+        def _copy_log():
+            try:
+                log_text.config(state="normal")
+                content = log_text.get("1.0", "end-1c")
+                log_text.config(state="disabled")
+                full_report = f"=== System Info ===\n{sys_info}\n\n=== Log ===\n{content}"
+                self.clipboard_clear()
+                self.clipboard_append(full_report)
+                messagebox.showinfo(self.t("t_done"), self.t("log_copy_ok"))
+            except Exception as e:
+                messagebox.showerror(self.t("t_err"), str(e))
+
+        def _open_log():
+            if os.path.isfile(LOG_FILE):
+                if sys.platform == "win32":
+                    os.startfile(LOG_FILE)
+                elif sys.platform == "darwin":
+                    subprocess.Popen(["open", LOG_FILE])
+                else:
+                    subprocess.Popen(["xdg-open", LOG_FILE])
+
+        def _clear_log():
+            try:
+                with open(LOG_FILE, "w", encoding="utf-8") as f:
+                    f.write("")
+                log_text.config(state="normal")
+                log_text.delete("1.0", tk.END)
+                log_text.insert("1.0", self.t("log_empty"))
+                log_text.config(state="disabled")
+                messagebox.showinfo(self.t("t_done"), self.t("log_cleared"))
+            except Exception as e:
+                messagebox.showerror(self.t("t_err"), str(e))
+
+        tk.Button(btn_frame, text=self.t("log_copy_btn"),
+                  font=("Segoe UI", 10), fg="white", bg="#3498db",
+                  activebackground="#2980b9", activeforeground="white",
+                  relief="flat", cursor="hand2", bd=0, padx=15, pady=5,
+                  command=_copy_log).pack(side="left", padx=5)
+
+        tk.Button(btn_frame, text=self.t("log_open_btn"),
+                  font=("Segoe UI", 10), fg="white", bg="#2ecc71",
+                  activebackground="#27ae60", activeforeground="white",
+                  relief="flat", cursor="hand2", bd=0, padx=15, pady=5,
+                  command=_open_log).pack(side="left", padx=5)
+
+        tk.Button(btn_frame, text=self.t("log_clear_btn"),
+                  font=("Segoe UI", 10), fg="white", bg="#e74c3c",
+                  activebackground="#c0392b", activeforeground="white",
+                  relief="flat", cursor="hand2", bd=0, padx=15, pady=5,
+                  command=_clear_log).pack(side="left", padx=5)
 
     # ---- 支持弹窗 ----
 
@@ -837,8 +1045,8 @@ class PersonalAssistant(tk.Tk):
         def pcb(info):
             self.after(0, self._cp_progress, info)
 
-        def dcb(c, tb, el):
-            self.after(0, self._cp_done, c, tb, el)
+        def dcb(c, tb, el, **kw):
+            self.after(0, self._cp_done, c, tb, el, kw)
 
         def ecb(e):
             self.after(0, self._cp_error, e)
@@ -849,6 +1057,7 @@ class PersonalAssistant(tk.Tk):
                 tasks = _collect_copy_tasks(src, dst)
                 run_copy_engine(tasks, pcb, dcb, ecb, self.cancel_event, w)
             except Exception as e:
+                log_error("cp_start", e)
                 ecb(e)
 
         threading.Thread(target=run, daemon=True).start()
@@ -871,7 +1080,9 @@ class PersonalAssistant(tk.Tk):
             self.cp_file_var.set(self.t("m_cur_file").format(
                 info["current_file"]))
 
-    def _cp_done(self, count, tb, elapsed):
+    def _cp_done(self, count, tb, elapsed, extras=None):
+        extras = extras or {}
+        copy_errors = extras.get("copy_errors", [])
         self.cp_progress_var.set(100)
         ss = format_size(tb)
         avg = format_size(int(tb / elapsed)) + "/s" if elapsed > 0 else ""
@@ -881,13 +1092,17 @@ class PersonalAssistant(tk.Tk):
         self.copying = False
         self._cp_set_enabled(True)
         self.cp_open_btn.config(state="normal")
-        messagebox.showinfo(self.t("t_done"),
-            self.t("m_ok_copy").format(count, ss, elapsed, avg))
+        msg = self.t("m_ok_copy").format(count, ss, elapsed, avg)
+        if copy_errors:
+            msg += "\n\n" + self.t("m_move_partial").format(
+                "\n".join(copy_errors[:10]))
+        messagebox.showinfo(self.t("t_done"), msg)
         s = self.cp_source_var.get()
         if s:
             self.cp_name_var.set(generate_copy_name(s))
 
     def _cp_error(self, e):
+        log_error("cp_error_ui", e)
         self.cp_status_var.set(self.t("m_err").format(e))
         self.cp_speed_var.set("")
         self.cp_file_var.set("")
@@ -1224,11 +1439,16 @@ class PersonalAssistant(tk.Tk):
         for p in selected:
             try:
                 if os.path.isdir(p):
-                    shutil.rmtree(p)
+                    shutil.rmtree(p, onerror=_rmtree_onerror)
                 elif os.path.isfile(p):
-                    os.remove(p)
+                    try:
+                        os.remove(p)
+                    except PermissionError:
+                        os.chmod(p, stat.S_IWRITE | stat.S_IREAD)
+                        os.remove(p)
                 deleted += 1
             except Exception as e:
+                log_error("delete_item", e, f"path={p}")
                 errors.append(f"{os.path.basename(p)}: {e}")
 
         self.tr_del_btn.config(state="normal",
@@ -1327,8 +1547,8 @@ class PersonalAssistant(tk.Tk):
         def pcb(info):
             self.after(0, self._tr_progress, info)
 
-        def dcb(c, tb, el):
-            self.after(0, self._tr_done, c, tb, el, op_t, is_move)
+        def dcb(c, tb, el, **kw):
+            self.after(0, self._tr_done, c, tb, el, op_t, is_move, kw)
 
         def ecb(e):
             self.after(0, self._tr_error, e)
@@ -1341,6 +1561,7 @@ class PersonalAssistant(tk.Tk):
                 run_copy_engine(tasks, pcb, dcb, ecb,
                                 self.cancel_event, w, ds)
             except Exception as e:
+                log_error("tr_start", e)
                 ecb(e)
 
         threading.Thread(target=run, daemon=True).start()
@@ -1363,7 +1584,10 @@ class PersonalAssistant(tk.Tk):
             self.tr_file_var.set(self.t("m_cur_proc").format(
                 info["current_file"]))
 
-    def _tr_done(self, count, tb, elapsed, op_t, is_move):
+    def _tr_done(self, count, tb, elapsed, op_t, is_move, extras=None):
+        extras = extras or {}
+        delete_errors = extras.get("delete_errors", [])
+        copy_errors = extras.get("copy_errors", [])
         self.tr_progress_var.set(100)
         ss = format_size(tb)
         avg = format_size(int(tb / elapsed)) + "/s" if elapsed > 0 else ""
@@ -1374,12 +1598,21 @@ class PersonalAssistant(tk.Tk):
         self.copying = False
         self._tr_set_enabled(True)
         self.tr_open_btn.config(state="normal")
-        messagebox.showinfo(self.t("t_done"),
-            self.t("m_tr_ok").format(op_t, count, ss, elapsed, avg))
+        msg = self.t("m_tr_ok").format(op_t, count, ss, elapsed, avg)
+        if delete_errors:
+            msg += "\n\n" + self.t("m_move_partial").format(
+                "\n".join(delete_errors[:10]))
+            if len(delete_errors) > 10:
+                msg += f"\n... (+{len(delete_errors) - 10})"
+        if copy_errors:
+            msg += "\n\n" + self.t("m_move_partial").format(
+                "\n".join(copy_errors[:10]))
+        messagebox.showinfo(self.t("t_done"), msg)
         if is_move:
             self._tr_refresh_list()
 
     def _tr_error(self, e):
+        log_error("tr_error_ui", e)
         self.tr_status_var.set(self.t("m_err").format(e))
         self.tr_speed_var.set("")
         self.tr_file_var.set("")
