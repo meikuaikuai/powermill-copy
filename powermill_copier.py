@@ -606,8 +606,8 @@ class PersonalAssistant(tk.Tk):
         self._i18n = []
 
         self.title("Personal Assistant — by MeiKuaiKuai")
-        self.geometry("700x650")
-        self.resizable(False, False)
+        self.geometry("700x750")
+        self.resizable(False, True)
         self.configure(bg="#f5f5f5")
 
         self._build_top_bar()
@@ -1293,11 +1293,11 @@ class PersonalAssistant(tk.Tk):
         ttk.Progressbar(ef, variable=self.tr_progress_var,
                         maximum=100).pack(fill="x", pady=(6, 0))
         ttk.Label(ef, textvariable=self.tr_status_var,
-                  foreground="gray").pack(anchor="w", pady=(3, 0))
+                  foreground="gray").pack(anchor="w", pady=(2, 0))
         ttk.Label(ef, textvariable=self.tr_speed_var,
-                  foreground="#006600").pack(anchor="w", pady=(1, 0))
+                  foreground="#006600").pack(anchor="w")
         ttk.Label(ef, textvariable=self.tr_file_var,
-                  foreground="gray").pack(anchor="w", pady=(1, 0))
+                  foreground="gray").pack(anchor="w")
 
     # -- 常用地址 --
 
