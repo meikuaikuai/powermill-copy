@@ -153,6 +153,7 @@ TEXTS = {
     "log_cleared": "日志已清空。",
     "m_move_partial": "剪切完成，但以下文件删除失败（已复制到目标）：\n{}",
     "m_move_skip": "跳过(权限不足): {}",
+    "m_disk_transfer": "源:{} 目标:{} → 使用 {} 线程",
   },
   "en": {
     "support_btn": "  Support & Contact  ",
@@ -274,6 +275,7 @@ TEXTS = {
     "log_cleared": "Log cleared.",
     "m_move_partial": "Move completed, but failed to delete these files (already copied):\n{}",
     "m_move_skip": "Skipped (access denied): {}",
+    "m_disk_transfer": "Src:{} Dst:{} → {} threads",
   }
 }
 
@@ -1382,20 +1384,29 @@ class PersonalAssistant(tk.Tk):
                 mtime, size = 0, 0
             entries.append((name, is_dir, mtime, size, full))
 
-        # 排序
+        # 分离文件夹和文件，分别排序（文件夹始终在前）
+        dirs = [e for e in entries if e[1]]
+        files = [e for e in entries if not e[1]]
+
         sort_idx = self._get_sort_index()
         if sort_idx == 0:    # 名称 A→Z
-            entries.sort(key=lambda e: e[0].lower())
+            key, rev = lambda e: e[0].lower(), False
         elif sort_idx == 1:  # 名称 Z→A
-            entries.sort(key=lambda e: e[0].lower(), reverse=True)
+            key, rev = lambda e: e[0].lower(), True
         elif sort_idx == 2:  # 时间 新→旧
-            entries.sort(key=lambda e: e[2], reverse=True)
+            key, rev = lambda e: e[2], True
         elif sort_idx == 3:  # 时间 旧→新
-            entries.sort(key=lambda e: e[2])
+            key, rev = lambda e: e[2], False
         elif sort_idx == 4:  # 大小 大→小
-            entries.sort(key=lambda e: e[3], reverse=True)
+            key, rev = lambda e: e[3], True
         elif sort_idx == 5:  # 大小 小→大
-            entries.sort(key=lambda e: e[3])
+            key, rev = lambda e: e[3], False
+        else:
+            key, rev = lambda e: e[0].lower(), False
+
+        dirs.sort(key=key, reverse=rev)
+        files.sort(key=key, reverse=rev)
+        entries = dirs + files
 
         for name, is_dir, mtime, size, full in entries:
             if is_dir:
@@ -1542,7 +1553,16 @@ class PersonalAssistant(tk.Tk):
         self.cancel_event.clear()
         self._tr_set_enabled(False)
         self.tr_progress_var.set(0)
-        self.tr_status_var.set(self.t("m_scanning"))
+
+        # 检测磁盘类型并显示
+        dt_src, w_src = detect_disk_type(src)
+        dt_dst, w_dst = detect_disk_type(dst)
+        w = min(w_src, w_dst)
+        self.tr_status_var.set(
+            self.t("m_disk_transfer").format(dt_src, dt_dst, w))
+        self.tr_speed_var.set("")
+        self.tr_file_var.set("")
+        self.update_idletasks()
 
         def pcb(info):
             self.after(0, self._tr_progress, info)
@@ -1555,8 +1575,8 @@ class PersonalAssistant(tk.Tk):
 
         def run():
             try:
+                pcb({"phase": "scan", "message": self.t("m_scanning")})
                 tasks = _collect_transfer_tasks(selected, dst, rename_map)
-                w = detect_workers_for_transfer(src, dst)
                 ds = selected if is_move else None
                 run_copy_engine(tasks, pcb, dcb, ecb,
                                 self.cancel_event, w, ds)
